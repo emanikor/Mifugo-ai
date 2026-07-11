@@ -1,0 +1,91 @@
+# Mifugo AI — local container orchestration.
+#
+# IMPORTANT: this is the ONLY time this project needs internet access —
+# `docker compose build` pulls base images and npm/pip packages once.
+# After that, `docker compose up` runs entirely offline: all four services
+# talk to each other over the local Docker network, nothing reaches out
+# past 127.0.0.1 / the compose network.
+#
+# Usage:
+#   docker compose build      # do this once, while you have connectivity
+#   docker compose up         # every time after, fully offline
+#   docker compose exec ollama ollama pull llama3.2:3b   # one-time model pull, needs internet
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mifugo
+      POSTGRES_USER: mifugo_user
+      POSTGRES_PASSWORD: changeme
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Auto-applies schema.sql on first container start only.
+      - ./backend/migrations/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports:
+      - "5432:5432"   # exposed to host for debugging with psql; not required
+    command: >
+      postgres -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mifugo_user -d mifugo"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    # NOTE: no GPU config here by default — Turkana field laptops are assumed
+    # CPU-only. If a machine has a GPU, uncomment the deploy block below.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://mifugo_user:changeme@db:5432/mifugo
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: llama3.2:3b
+      SECRET_KEY: changeme-generate-a-real-random-key
+      APP_ENV: production
+      # Frontend origin allowed to call this API (see app/config.py CORS setup)
+      CORS_ORIGINS: http://localhost:5173
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app   # bind mount for live dev editing; remove for a locked-down field build
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules   # keep container's node_modules, don't shadow with host's
+
+volumes:
+  pgdata:
+  ollama_models:
